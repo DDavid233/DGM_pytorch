@@ -1,4 +1,6 @@
 import os
+
+import numpy
 import torch
 import numpy as np
 
@@ -8,9 +10,12 @@ from torch.nn import Module, ModuleList, Sequential
 from torch_geometric.nn import EdgeConv, DenseGCNConv, DenseGraphConv, GCNConv, GATConv
 from torch.utils.data import DataLoader
 import torch_scatter
+from sklearn.metrics import confusion_matrix
+import sklearn
 
 import pytorch_lightning as pl
 from argparse import Namespace
+from typing import List
 
 from DGMlib.layers import *
 if (not os.environ.get("USE_KEOPS")) or os.environ.get("USE_KEOPS")=="False":
@@ -26,7 +31,7 @@ class DGM_Model(pl.LightningModule):
 #         self.hparams=hparams
         self.save_hyperparameters(hparams)
         conv_layers = hparams.conv_layers
-        fc_layers = hparams.fc_layers
+        fc_layers: List = hparams.fc_layers
         dgm_layers = hparams.dgm_layers
         k = hparams.k
 
@@ -55,12 +60,12 @@ class DGM_Model(pl.LightningModule):
                 self.node_g.append(GCNConv(conv_l[0],conv_l[1]))
             if hparams.gfun == 'gat':
                 self.node_g.append(GATConv(conv_l[0],conv_l[1]))
-        
+
+        fc_layers.insert(0, hparams.n_nodes * fc_layers[0])
         self.fc = MLP(fc_layers, final_activation=False)
         if hparams.pre_fc is not None and len(hparams.pre_fc)>0:
             self.pre_fc = MLP(hparams.pre_fc, final_activation=True)
         self.avg_accuracy = None
-        
         
         #torch lightning specific
         self.automatic_optimization = False
@@ -84,7 +89,8 @@ class DGM_Model(pl.LightningModule):
             graph_x = torch.cat([graph_x,x.detach()],-1)
             if lprobs is not None:
                 lprobslist.append(lprobs)
-                
+
+        x = torch.reshape(x, (x.shape[0], -1))
         return self.fc(x),torch.stack(lprobslist,-1) if len(lprobslist)>0 else None
    
     def configure_optimizers(self):
@@ -96,90 +102,99 @@ class DGM_Model(pl.LightningModule):
         optimizer = self.optimizers(use_pl_optimizer=True)
         optimizer.zero_grad()
         
-        X, y, mask, edges = train_batch
+        X, y, edges = train_batch
         edges = edges[0]
         
-        assert(X.shape[0]==1) #only works in transductive setting
-        mask=mask[0]
+        # assert(X.shape[0]==1) #only works in transductive setting
+        # mask=mask[0]
         
         pred,logprobs = self(X,edges)
         
-        train_pred = pred[:,mask.to(torch.bool),:]
-        train_lab = y[:,mask.to(torch.bool),:]
+        # train_pred = pred[:,mask.to(torch.bool),:]
+        train_pred = pred
+        # train_lab = y[:,mask.to(torch.bool),:]
+        train_lab = y
 #         train_w = weight[None,mask.to(torch.bool)]    
 
         #loss = torch.nn.functional.cross_entropy(train_pred.view(-1,train_pred.shape[-1]),train_lab.argmax(-1).flatten())
-        loss = torch.nn.functional.binary_cross_entropy_with_logits(train_pred,train_lab)
+        # loss = torch.nn.functional.binary_cross_entropy_with_logits(train_pred,train_lab)
+        loss = torch.nn.functional.nll_loss(train_pred, train_lab)
         loss.backward()
 
-        correct_t = (train_pred.argmax(-1) == train_lab.argmax(-1)).float().mean().item()
-
-        #GRAPH LOSS
-        if logprobs is not None: 
-            corr_pred = (train_pred.argmax(-1)==train_lab.argmax(-1)).float().detach()
-            wron_pred = (1-corr_pred)
-
-            if self.avg_accuracy is None:
-                self.avg_accuracy = torch.ones_like(corr_pred)*0.5
-
-            point_w = (self.avg_accuracy-corr_pred)#*(1*corr_pred + self.k*(1-corr_pred))
-            graph_loss = point_w * logprobs[:,mask.to(torch.bool),:].exp().mean([-1,-2])
-
-            graph_loss = graph_loss.mean()# + self.graph_f[0].Pr.abs().sum()*1e-3
-            graph_loss.backward()
-            
-            self.log('train_graph_loss', graph_loss.detach().cpu())
-            if(self.debug):
-                self.point_w = point_w.detach().cpu()
-                
-            self.avg_accuracy = self.avg_accuracy.to(corr_pred.device)*0.95 +  0.05*corr_pred
+        correct_t = (train_pred.argmax(-1) == train_lab).float().mean().item()
             
         optimizer.step()
 
         self.log('train_acc', correct_t)
+        # print(correct_t)
         self.log('train_loss', loss.detach().cpu())
         
     
     def test_step(self, train_batch, batch_idx):
-        X, y, mask, edges = train_batch
+        X, y, edges = train_batch
         edges = edges[0]
-        
-        assert(X.shape[0]==1) #only works in transductive setting
-        mask=mask[0]
-        pred,logprobs = self(X,edges)
+
+        pred, logprobs = self(X,edges)
         pred = pred.softmax(-1)
         for i in range(1,self.hparams.test_eval):
             pred_,logprobs = self(X,edges)
             pred+=pred_.softmax(-1)
-        test_pred = pred[:,mask.to(torch.bool),:]
-        test_lab = y[:,mask.to(torch.bool),:]
+        # test_pred = pred[:,mask.to(torch.bool),:]
+        test_pred = pred
+        # test_lab = y[:,mask.to(torch.bool),:]
+        test_lab = y
         correct_t = (test_pred.argmax(-1) == test_lab.argmax(-1)).float().mean().item()
-        loss = torch.nn.functional.binary_cross_entropy_with_logits(test_pred,test_lab)
-        self.log('test_loss', loss.detach().cpu())
-#         self.log('test_graph_loss', loss.detach().cpu())
-        self.log('test_acc', 100*correct_t)
+        # loss = torch.nn.functional.binary_cross_entropy_with_logits(test_pred,test_lab)
+        label_pred = test_pred.cpu()[:, 1]
+        fpr, tpr, _ = sklearn.metrics.roc_curve(test_lab.cpu(), label_pred)
+        auc = 100 * sklearn.metrics.auc(fpr, tpr)
+        tn, fp, fn, tp = confusion_matrix(test_lab.cpu(), test_pred.argmax(-1).cpu(), labels=[0, 1]).ravel()
+        sensitivity = tp / (tp + fn)
+        specificity = tn / (tn + fp)
+        # loss = torch.nn.functional.binary_cross_entropy_with_logits(test_pred,test_lab)
+        loss = torch.nn.functional.nll_loss(test_pred, test_lab)
+        self.log('test_loss', loss.detach())
+        self.log('test_acc', 100 * correct_t, prog_bar=True)
+        if not numpy.isnan(auc):
+            self.log('test_auc', auc, prog_bar=True)
+        if not numpy.isnan(sensitivity):
+            self.log('test_sensitivity', sensitivity, prog_bar=True)
+        if not numpy.isnan(specificity):
+            self.log('test_specificity', specificity, prog_bar=True)
     
     def validation_step(self, train_batch, batch_idx):
-        X, y, mask, edges = train_batch
+        X, y, edges = train_batch
         edges = edges[0]
         
         
-        assert(X.shape[0]==1) #only works in transductive setting
-        mask=mask[0]
+        # assert(X.shape[0]==1) #only works in transductive setting
         
         pred,logprobs = self(X,edges)
         pred = pred.softmax(-1)
-        for i in range(1,self.hparams.test_eval):
-            pred_,logprobs = self(X,edges)
-            pred+=pred_.softmax(-1)
+        # for i in range(1,self.hparams.test_eval):
+        #     pred_,logprobs = self(X,edges)
+        #     pred+=pred_.softmax(-1)
         
-        test_pred = pred[:,mask.to(torch.bool),:]
-        test_lab = y[:,mask.to(torch.bool),:]
-        correct_t = (test_pred.argmax(-1) == test_lab.argmax(-1)).float().mean().item()
-        loss = torch.nn.functional.binary_cross_entropy_with_logits(test_pred,test_lab)
-        
+        # test_pred = pred[:,mask.to(torch.bool),:]
+        # test_lab = y[:,mask.to(torch.bool),:]
+        test_pred = pred
+        test_lab = y
+        correct_t = (test_pred.argmax(-1) == test_lab).float().mean().item()
+        label_pred = test_pred.cpu()[:, 1]
+        fpr, tpr, _ = sklearn.metrics.roc_curve(test_lab.cpu(), label_pred)
+        auc = 100 * sklearn.metrics.auc(fpr, tpr)
+        tn, fp, fn, tp = confusion_matrix(test_lab.cpu(), test_pred.argmax(-1).cpu(), labels=[0, 1]).ravel()
+        sensitivity = tp / (tp + fn)
+        specificity = tn / (tn + fp)
+        # loss = torch.nn.functional.binary_cross_entropy_with_logits(test_pred,test_lab)
+        loss = torch.nn.functional.nll_loss(test_pred,test_lab)
         self.log('val_loss', loss.detach())
-        self.log('val_acc', 100*correct_t)
+        self.log('val_acc', 100*correct_t, prog_bar=True)
+        if not numpy.isnan(auc):
+            self.log('val_auc', auc, prog_bar=True)
+        if not numpy.isnan(sensitivity):
+            self.log('val_sensitivity', sensitivity, prog_bar=True)
+        self.log('val_specificity', specificity, prog_bar=True)
         
 #         ####### visualizations ###########
 #         try:

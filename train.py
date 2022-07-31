@@ -2,8 +2,8 @@ import sys
 sys.path.insert(0,'./keops')
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"]="0"
-os.environ["USE_KEOPS"] = "True";
+# os.environ["CUDA_VISIBLE_DEVICES"]="0"
+os.environ["USE_KEOPS"] = "False"
 
 import pickle
 import numpy as np
@@ -17,27 +17,47 @@ from DGMlib.model_dDGM import DGM_Model
 from argparse import ArgumentParser
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
+from brain_dataset import MyBrainDataset
+from torch.utils.data import random_split
+from BrainGB.dataset.transforms import Adj
+
 
 def run_training_process(run_params):
     
     train_data = None
     test_data = None
+    n_features = 0
+    num_classes = 2
     
     if run_params.dataset in ['Cora', 'CiteSeer', 'PubMed']:
         train_data = PlanetoidDataset(split='train', name=run_params.dataset, device='cuda')
         val_data = PlanetoidDataset(split='val', name=run_params.dataset, samples_per_epoch=1)
         test_data = PlanetoidDataset(split='test', name=run_params.dataset, samples_per_epoch=1)
+        n_features = train_data.n_features
         
     if run_params.dataset == 'tadpole':
         train_data = TadpoleDataset(fold=run_params.fold,train=True, device='cuda')
         val_data = test_data = TadpoleDataset(fold=run_params.fold, train=False,samples_per_epoch=1)
+        n_features = train_data.n_features
+    elif run_params.dataset in ['ABCD', 'ABIDE']:
+        dataset = MyBrainDataset(root=f'datasets/{run_params.dataset}',
+                               name=run_params.dataset,
+                               pre_transform=Adj())
+        dataset = dataset.data
+        # Random split
+        length = len(dataset)
+        train_data, test_data = random_split(dataset, [int(0.7 * length), length - int(0.7 * length)])
+        n_features = dataset[0][0].shape[1]
+        run_params.n_nodes = dataset[0][0].shape[0]
+        val_data, test_data = random_split(test_data, [int(0.5 * len(test_data)), len(test_data) - int(0.5 * len(test_data))])
+
                                    
     if train_data is None:
         raise Exception("Dataset %s not supported" % run_params.dataset)
         
-    train_loader = DataLoader(train_data, batch_size=1,num_workers=0)
-    val_loader = DataLoader(val_data, batch_size=1)
-    test_loader = DataLoader(test_data, batch_size=1)
+    train_loader = DataLoader(train_data, batch_size=32, num_workers=0)
+    val_loader = DataLoader(val_data, batch_size=32)
+    test_loader = DataLoader(test_data, batch_size=32)
 
     class MyDataModule(pl.LightningDataModule):
         def setup(self,stage=None):
@@ -53,11 +73,11 @@ def run_training_process(run_params):
     #configure input feature size
     if run_params.pre_fc is None or len(run_params.pre_fc)==0: 
         if len(run_params.dgm_layers[0])>0:
-            run_params.dgm_layers[0][0]=train_data.n_features
-        run_params.conv_layers[0][0]=train_data.n_features
+            run_params.dgm_layers[0][0] = n_features
+        run_params.conv_layers[0][0] = n_features
     else:
-        run_params.pre_fc[0]=train_data.n_features
-    run_params.fc_layers[-1] = train_data.num_classes
+        run_params.pre_fc[0] = n_features
+    run_params.fc_layers[-1] = num_classes
     
     model = DGM_Model(run_params)
 
@@ -84,8 +104,9 @@ def run_training_process(run_params):
                                             callbacks=callbacks)
     
     trainer.fit(model, datamodule=MyDataModule())
-    trainer.test()
-    
+    trainer.test(model, datamodule=MyDataModule())
+
+
 if __name__ == "__main__":
 
     parser = ArgumentParser()

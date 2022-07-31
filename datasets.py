@@ -30,8 +30,7 @@ class UKBBAgeDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         return self.X,self.y,self.mask
     
-    
-    
+
 class TadpoleDataset(torch.utils.data.Dataset):
     """Face Landmarks dataset."""
 
